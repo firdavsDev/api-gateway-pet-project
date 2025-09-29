@@ -1,157 +1,152 @@
 import asyncio
 import os
 import time
-from typing import Dict
 
 import httpx
-import jwt
 import redis.asyncio as aioredis
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from jose import JWTError, jwt
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from starlette.responses import JSONResponse, Response
 
-# Config from env
+app = FastAPI()
+
+# ENV VARS
 BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-JWT_SECRET = os.getenv("JWT_SECRET", "supersecret123")
-GLOBAL_RATE = int(os.getenv("GLOBAL_RATE", "200"))  # global RPS per api_key (demo)
-LOCAL_RATE = int(os.getenv("LOCAL_RATE", "50"))  # tokens/sec per process
-
-app = FastAPI(title="Demo API Gateway")
-
-redis = None
-http_client = httpx.AsyncClient(
-    timeout=10.0, limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
+JWT_SECRET = os.getenv("JWT_SECRET", "supersecretkey")
+GLOBAL_RATE = int(os.getenv("GLOBAL_RATE", "100"))  # req/sec
+# === Prometheus Metrics ===
+REQUEST_COUNT = Counter(
+    "http_requests_total", "Total HTTP requests", ["method", "endpoint", "http_status"]
 )
+REQUEST_LATENCY = Histogram(
+    "http_request_duration_seconds", "Request latency (s)", ["endpoint"]
+)
+RATE_LIMITED_COUNT = Counter(
+    "http_rate_limited_total",
+    "Number of requests rejected due to rate limiting",
+    ["endpoint"],
+)
+# Create global Redis connection instance (async)
+redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+
+# Local token bucket
+RATE_WINDOW = 1.0  # 1 second
+local_tokens = GLOBAL_RATE
+last_refill = time.monotonic()
 
 
-# --- local token bucket (per API key in this process) ---
-class LocalTokenBucket:
-    def __init__(self, rate: int, capacity: int = None):
-        self.rate = rate
-        self.capacity = capacity or rate
-        self.tokens = self.capacity
-        self.last = time.monotonic()
-        self.lock = asyncio.Lock()
-
-    async def consume(self, n: int = 1) -> bool:
-        async with self.lock:
-            now = time.monotonic()
-            elapsed = now - self.last
-            refill = elapsed * self.rate
-            if refill > 0:
-                self.tokens = min(self.capacity, self.tokens + refill)
-                self.last = now
-            if self.tokens >= n:
-                self.tokens -= n
-                return True
-            return False
-
-
-# store per-api_key
-local_buckets: Dict[str, LocalTokenBucket] = {}
-
-
-async def get_local_bucket(api_key: str) -> LocalTokenBucket:
-    b = local_buckets.get(api_key)
-    if not b:
-        b = LocalTokenBucket(rate=LOCAL_RATE, capacity=LOCAL_RATE * 2)
-        local_buckets[api_key] = b
-    return b
-
-
-# --- global simple fixed-window limiter using Redis INCR ---
-async def global_allow(api_key: str) -> bool:
-    # fixed-window per second (demo). Key: rate:{api_key}:{epoch_second}
-    now_s = int(time.time())
-    key = f"rate:{api_key}:{now_s}"
-    # atomic increment with expiration
-    val = await redis.incr(key)
-    if val == 1:
-        await redis.expire(key, 2)
-    if val > GLOBAL_RATE:
-        return False
-    return True
-
-
-# --- JWT validation (HS256) ---
-def validate_jwt(token: str):
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        # Expect payload contains sub or api_key
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired"
-        )
-    except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
-        )
+shutdown_event = asyncio.Event()
 
 
 @app.on_event("startup")
-async def startup():
-    global redis
-    redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+async def startup_event():
+    print("✅ Gateway starting up...")
 
 
 @app.on_event("shutdown")
-async def shutdown():
-    await http_client.aclose()
-    if redis:
-        await redis.close()
+async def shutdown_event_handler():
+    print("🛑 Gateway shutting down gracefully...")
+    await redis_client.close()
+
+
+async def verify_jwt(token: str):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return payload
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+async def rate_limiter(api_key: str):
+    global local_tokens, last_refill
+
+    now = time.monotonic()
+    elapsed = now - last_refill
+    refill = elapsed * GLOBAL_RATE
+    if refill >= 1:
+        local_tokens = min(GLOBAL_RATE, local_tokens + int(refill))
+        last_refill = now
+
+    if local_tokens <= 0:
+        raise HTTPException(status_code=429, detail="Too many requests (local limit)")
+    local_tokens -= 1
+
+    # Use redis_client directly — it's already a connected instance
+    key = f"rate:{api_key}:{int(now)}"
+    count = await redis_client.incr(key)
+    if count == 1:
+        await redis_client.expire(key, 1)
+
+    if count > GLOBAL_RATE:
+        raise HTTPException(status_code=429, detail="Too many requests (global limit)")
 
 
 @app.middleware("http")
-async def auth_and_rate_middleware(request: Request, call_next):
-    # Bypass for health or non-proxied endpoints
-    if request.url.path in ("/health", "/openapi.json", "/docs"):
+async def metrics_middleware(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        process_time = time.perf_counter() - start_time
+        endpoint = request.url.path
+        status_code = response.status_code if response else 500
+
+        REQUEST_COUNT.labels(request.method, endpoint, status_code).inc()
+        REQUEST_LATENCY.labels(endpoint).observe(process_time)
+
+
+@app.middleware("http")
+async def auth_and_rate_limit(request: Request, call_next):
+    if request.url.path.startswith("/health") or request.url.path.startswith(
+        "/metrics"
+    ):
         return await call_next(request)
 
-    auth = request.headers.get("authorization")
-    if not auth or not auth.startswith("Bearer "):
-        return JSONResponse(status_code=401, content={"detail": "Missing auth token"})
-    token = auth.split(" ", 1)[1].strip()
+    auth_header = request.headers.get("authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return JSONResponse(status_code=401, content={"detail": "Missing token"})
+
+    token = auth_header.split(" ", 1)[1]
+    payload = await verify_jwt(token)
+    api_key = payload.get("sub")
+    if not api_key:
+        return JSONResponse(
+            status_code=401, content={"detail": "Invalid token payload"}
+        )
+
     try:
-        payload = validate_jwt(token)
+        await rate_limiter(api_key)
     except HTTPException as e:
+        # ✅ Properly return JSON 429 instead of blowing up
+        if e.status_code == 429:
+            RATE_LIMITED_COUNT.labels(request.url.path).inc()
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
 
-    api_key = payload.get("sub") or payload.get("api_key") or "unknown"
-
-    # Local bucket
-    bucket = await get_local_bucket(api_key)
-    allowed_local = await bucket.consume(1)
-    if not allowed_local:
-        return JSONResponse(
-            status_code=429, content={"detail": "local rate limit exceeded"}
-        )
-
-    # Global limiter
-    allowed_global = await global_allow(api_key)
-    if not allowed_global:
-        return JSONResponse(
-            status_code=429, content={"detail": "global rate limit exceeded"}
-        )
-
-    # attach payload to request state for handlers
-    request.state.jwt = payload
-    return await call_next(request)
-
-
-# --- proxy endpoint to backend ---
-@app.get("/api/resource")
-async def proxy_resource(request: Request):
-    # forward headers (except host) and keep connection pooled
-    headers = {}
-    for k, v in request.headers.items():
-        if k.lower() != "host":
-            headers[k] = v
+    # Proxy to backend
     try:
-        resp = await http_client.get(f"{BACKEND_URL}/api/resource", headers=headers)
-    except httpx.RequestError:
-        raise HTTPException(status_code=502, detail="backend unreachable")
-    return JSONResponse(status_code=resp.status_code, content=resp.json())
+        async with httpx.AsyncClient() as client:
+            backend_resp = await client.request(
+                request.method,
+                f"{BACKEND_URL}{request.url.path}",
+                headers=request.headers.raw,
+                content=await request.body(),
+            )
+            return JSONResponse(
+                status_code=backend_resp.status_code, content=backend_resp.json()
+            )
+    except Exception as e:
+        # Catch backend errors and still return something nice
+        return JSONResponse(status_code=502, content={"detail": str(e)})
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/health")

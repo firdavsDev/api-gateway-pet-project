@@ -1,31 +1,24 @@
 import os
 
+import httpx
 import requests
 
 from locust import HttpUser, between, task
 
-AUTH_URL = os.getenv("AUTH_URL", "http://auth:8001")
-GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8080")
+GATEWAY_URL = os.getenv("LOCUST_HOST", "http://gateway:8080")
+AUTH_URL = os.getenv("AUTH_URL", "http://auth:8001/token")
+TOKEN = None
 
 
 class GatewayUser(HttpUser):
-    wait_time = between(0.001, 0.005)  # tweak to increase concurrency
+    wait_time = between(0.01, 0.1)  # 10-100ms between requests
 
     def on_start(self):
-        # obtain token once per user
-        r = requests.post(f"{AUTH_URL}/token", data={"client_id": "locust-user"})
-        if r.status_code != 200:
-            raise Exception("failed to get token")
-        j = r.json()
-        self.token = j["access_token"]
+        global TOKEN
+        resp = httpx.get(AUTH_URL)
+        TOKEN = resp.json()["access_token"]
 
     @task
     def hit_resource(self):
-        headers = {"Authorization": f"Bearer {self.token}"}
-        with self.client.get(
-            "/api/resource", headers=headers, name="/api/resource", catch_response=True
-        ) as resp:
-            if resp.status_code != 200:
-                resp.failure(f"status {resp.status_code}")
-            else:
-                resp.success()
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        self.client.get(f"{GATEWAY_URL}/api/resource", headers=headers)

@@ -1,23 +1,19 @@
 import os
-import time
+from datetime import datetime, timedelta
 
-import jwt
 from fastapi import FastAPI
+from jose import jwt
 
-JWT_SECRET = os.getenv("JWT_SECRET", "supersecret123")
+JWT_SECRET = os.getenv("JWT_SECRET", "supersecretkey")
+
 app = FastAPI()
 
 
-@app.post("/token")
-async def get_token(client_id: str = "test-client", ttl: int = 300):
-    now = int(time.time())
-    payload = {
-        "sub": client_id,
-        "iat": now,
-        "exp": now + ttl,
-    }
+@app.get("/token")
+async def generate_token(sub: str = "demo-client"):
+    payload = {"sub": sub, "exp": datetime.utcnow() + timedelta(minutes=5)}
     token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-    return {"access_token": token, "expires_in": ttl}
+    return {"access_token": token, "token_type": "bearer"}
 
 
 @app.get("/health")

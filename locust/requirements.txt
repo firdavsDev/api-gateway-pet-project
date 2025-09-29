@@ -1,3 +1,4 @@
 locust
 requests
 gevent
+httpx
