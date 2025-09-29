@@ -6,10 +6,8 @@ app = FastAPI()
 
 
 @app.get("/api/resource")
-async def resource(request: Request):
-    # simulate small processing
-    ts = time.time()
-    return {"ok": True, "ts": ts, "service": "backend"}
+async def get_resource():
+    return {"message": "Hello from backend"}
 
 
 @app.get("/health")

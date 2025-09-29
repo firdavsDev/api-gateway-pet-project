@@ -39,7 +39,7 @@ services:
       - AUTH_URL=http://auth:8001
       - REDIS_URL=redis://redis:6379/0
       - JWT_SECRET=supersecretkey
-      - GLOBAL_RATE=100 # 100 req/sec per key
+      - GLOBAL_RATE=10000
     ports:
       - "8080:8080"
 
