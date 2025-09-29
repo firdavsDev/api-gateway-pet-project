@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis_server
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./services/backend
+    container_name: backend
+    ports:
+      - "8000:8000"
+
+  auth:
+    build: ./services/auth
+    container_name: auth
+    environment:
+      - JWT_SECRET=supersecretkey
+    ports:
+      - "8001:8001"
+
+  gateway:
+    build: ./gateway
+    container_name: gateway
+    depends_on:
+      - backend
+      - auth
+      - redis
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - AUTH_URL=http://auth:8001
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET=supersecretkey
+      - GLOBAL_RATE=100 # 100 req/sec per key
+    ports:
+      - "8080:8080"
+
+  locust:
+    build: ./locust
+    container_name: locust
+    depends_on:
+      - gateway
+    environment:
+      - LOCUST_HOST=http://gateway:8080
+    ports:
+      - "8089:8089"

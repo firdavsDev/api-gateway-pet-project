@@ -1,0 +1,7 @@
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
+httpx==0.24.1
+redis>=4.5.0
+PyJWT==2.8.0
+aioredis
+python-jose
