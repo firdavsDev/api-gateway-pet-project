@@ -8,3 +8,4 @@ __pycache__/
 *.log
 *.env
 *.DS_Store
+loki-data/

@@ -1,0 +1,48 @@
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9095
+
+ingester:
+  lifecycler:
+    address: 127.0.0.1
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+    final_sleep: 0s
+  chunk_idle_period: 5m
+  max_chunk_age: 1h
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb           # ✅ required for Loki >=2.8
+      object_store: filesystem
+      schema: v13           # ✅ upgraded schema
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /loki/index
+    cache_location: /loki/cache
+  filesystem:
+    directory: /loki/chunks
+
+limits_config:
+  allow_structured_metadata: false   # ✅ disables strict metadata checks
+  ingestion_rate_mb: 8
+  ingestion_burst_size_mb: 16
+  max_streams_per_user: 0
+  max_entries_limit_per_query: 5000
+
+# ✅ compactor section now simplified (no shared_store!)
+compactor:
+  working_directory: /loki/compactor
+
+table_manager:
+  retention_deletes_enabled: true
+  retention_period: 168h
