@@ -1,2 +1,6 @@
 fastapi==0.95.2
 uvicorn[standard]==0.22.0
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-requests

@@ -7,10 +7,25 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from jose import JWTError, jwt
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from starlette.responses import JSONResponse, Response
 
-app = FastAPI()
+# ✅ Setup OTEL Tracer
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+
+otlp_exporter = OTLPSpanExporter(endpoint="http://tempo:4317", insecure=True)
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
+
+# Wrap FastAPI app with instrumentation
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+app = FastAPI(title="API Gateway", version="1.0.0")
+FastAPIInstrumentor.instrument_app(app)
 
 # ENV VARS
 BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")

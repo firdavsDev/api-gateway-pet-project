@@ -78,6 +78,7 @@ services:
       - loki
     volumes:
       - grafana-data:/var/lib/grafana
+      - ./infra/grafana/datasources:/etc/grafana/provisioning/datasources
 
   loki:
     image: grafana/loki:latest
